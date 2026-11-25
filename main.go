@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -63,9 +64,14 @@ func analyzeFile(filePath string, rules []Rule) ([]Finding, error) {
 
 	head := make([]byte, 512)
 	n, err := file.Read(head)
-	if err != nil {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
+
+	if n == 0 {
+		return nil, nil
+	}
+
 	if bytes.IndexByte(head[:n], 0) != -1 {
 		return nil, nil
 	}
@@ -105,22 +111,23 @@ func analyzeFile(filePath string, rules []Rule) ([]Finding, error) {
 
 	if err := scanner.Err(); err != nil {
 		if errors.Is(err, bufio.ErrTooLong) {
-			return res, fmt.Errorf("предупреждение: в файле встречена строка длиннее 10MB, сканирование прервано: %w", err)
+			return res, fmt.Errorf("[{!} analyzeFile] предупреждение: в файле встречена строка длиннее 10MB, сканирование прервано: %w", err)
 		}
-		return res, fmt.Errorf("ошибка чтения файла: %w", err)
+		return res, fmt.Errorf("[{!} analyzeFile] ошибка чтения файла: %w", err)
 	}
 
 	return res, nil
 }
 
-func analyzeDirectory(directoryPath string, rules []Rule) ([][]Finding, error) {
+func analyzeDirectory(directoryPath string, rules []Rule) ([]Finding, error) {
 	skipDirectory := []string{".git", ".idea", "node_modules"}
 
-	var findings [][]Finding
+	var findings []Finding
 
 	err := filepath.WalkDir(directoryPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return err
+			log.Printf("[{!} analyzeDirectory] error: %s", err.Error())
+			return nil
 		}
 
 		if d.IsDir() {
@@ -129,16 +136,28 @@ func analyzeDirectory(directoryPath string, rules []Rule) ([][]Finding, error) {
 			}
 			return nil
 		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
 
-		finding, err := analyzeFile(path, rules)
+		info, err := d.Info()
 		if err != nil {
 			return nil
 		}
-		if len(finding) == 0 {
+
+		if info.Size() > 157_286_400 {
+			log.Printf("[{!} analyzeDirectory] file %s more than 150mb", path)
 			return nil
 		}
 
-		findings = append(findings, finding)
+		finding, err := analyzeFile(path, rules)
+
+		if len(finding) != 0 {
+			findings = append(findings, finding...)
+		}
+		if err != nil {
+			log.Printf("[{!} analyzeDirectory] %s: %v", path, err)
+		}
 
 		return nil
 	})
@@ -153,8 +172,10 @@ func analyzeDirectory(directoryPath string, rules []Rule) ([][]Finding, error) {
 func main() {
 	var (
 		path string
+		file string
 	)
-	flag.StringVar(&path, "path", "", "directory check")
+	flag.StringVar(&path, "path", ".", "directory check")
+	flag.StringVar(&file, "file", "", "file check")
 	flag.Parse()
 
 	tgBotToken := Rule{
@@ -172,37 +193,37 @@ func main() {
 	}
 
 	rules := []Rule{tgBotToken, privateKey}
+	var findings []Finding
+	var err error
 
-	if len(path) != 0 {
-		findings, err := analyzeDirectory(path, rules)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
+	if len(file) != 0 {
+		findings, err = analyzeFile(file, rules)
+	} else if len(path) != 0 {
 
-		for _, directory := range findings {
-			for _, finding := range directory {
-				fmt.Println("\n")
-				fmt.Printf("RuleID: %s\n", finding.RuleID)
-				fmt.Printf("Severity: %s\n", finding.Severity)
-				fmt.Printf("FilePath: %s\n", finding.FilePath)
-				fmt.Printf("Line: %d\n", finding.Line)
-				fmt.Printf("Match: %s\n", finding.Match)
+		if path == "." {
+			path, err = os.Getwd()
+			if err != nil {
+				panic(err)
 			}
+			findings, err = analyzeDirectory(path, rules)
+
+		} else {
+			findings, err = analyzeDirectory(path, rules)
+
 		}
-
 	}
-	// if err != nil {
-	// 	fmt.Fprintf(os.Stderr, "error: %v\n", err)
-	// 	os.Exit(1)
-	// }
-	// for _, finding := range findings {
-	// 	fmt.Println("\n")
-	// 	fmt.Printf("RuleID: %s\n", finding.RuleID)
-	// 	fmt.Printf("Severity: %s\n", finding.Severity)
-	// 	fmt.Printf("FilePath: %s\n", finding.FilePath)
-	// 	fmt.Printf("Line: %d\n", finding.Line)
-	// 	fmt.Printf("Match: %s\n", finding.Match)
-	// }
 
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	for _, finding := range findings {
+		fmt.Println()
+		fmt.Printf("RuleID: %s\n", finding.RuleID)
+		fmt.Printf("Severity: %s\n", finding.Severity)
+		fmt.Printf("FilePath: %s\n", finding.FilePath)
+		fmt.Printf("Line: %d\n", finding.Line)
+		fmt.Printf("Match: %s\n", finding.Match)
+	}
 }
