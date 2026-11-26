@@ -1,0 +1,24 @@
+[
+    {
+        "id": "tg-bot-token",
+        "description": "Detected telegram bot token",
+        "regex": "\\b[0-9]{8,10}:([a-zA-Z0-9_-]{35})\\b",
+        "secret_group": 1,
+        "entropy": 3.8,
+        "severity": "WARNING"
+    },
+    {
+        "id": "private-key",
+        "description": "Detected private key",
+        "regex": "-----BEGIN (?:RSA|DSA|EC|OPENSSH|PGP) PRIVATE KEY-----",
+        "severity": "WARNING"
+    },
+    {
+        "id": "generic-api-key",
+        "description": "Detected generic API key",
+        "regex": "(?i)(?:api[_-]?key|secret|token)['\"]?\\s*[:=]\\s*['\"]([a-zA-Z0-9_\\-]{20,})['\"]",
+        "secret_group": 1,
+        "entropy": 3.8,
+        "severity": "WARNING"
+    }
+]

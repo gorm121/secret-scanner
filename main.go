@@ -3,22 +3,29 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"math"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
+	"sync"
 )
 
 type Rule struct {
 	ID          string
 	Description string
 	Pattern     *regexp.Regexp
+	SecretGroup int
+	Entropy     float64
 	Severity    string
 }
 
@@ -55,7 +62,13 @@ func maskSecret(secret string) string {
 	return string(resRunes)
 }
 
-func analyzeFile(filePath string, rules []Rule) ([]Finding, error) {
+func analyzeFile(ctx context.Context, filePath string, rules []Rule) ([]Finding, error) {
+	var findings []Finding
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
@@ -87,23 +100,41 @@ func analyzeFile(filePath string, rules []Rule) ([]Finding, error) {
 	scanner.Buffer(buf, maxCapacity)
 
 	var numLine int
-	var res []Finding
 
 	for scanner.Scan() {
+
+		if ctx.Err() != nil {
+			return findings, ctx.Err()
+		}
+
 		numLine++
 		line := scanner.Text()
 		for _, rule := range rules {
-			secrets := rule.Pattern.FindAllString(line, -1)
+			if rule.Pattern == nil {
+				continue
+			}
+			allMatches := rule.Pattern.FindAllStringSubmatch(line, -1)
 
-			for _, scrt := range secrets {
+			for _, match := range allMatches {
+
+				secret := match[0]
+
+				if rule.SecretGroup > 0 && rule.SecretGroup < len(match) {
+					secret = match[rule.SecretGroup]
+				}
+
+				if rule.Entropy > 0 && shannonEntropy(secret) < rule.Entropy {
+					continue
+				}
+
 				finding := Finding{
 					RuleID:   rule.ID,
 					Severity: rule.Severity,
 					FilePath: filePath,
 					Line:     numLine,
-					Match:    maskSecret(scrt),
+					Match:    maskSecret(secret),
 				}
-				res = append(res, finding)
+				findings = append(findings, finding)
 			}
 
 		}
@@ -111,93 +142,180 @@ func analyzeFile(filePath string, rules []Rule) ([]Finding, error) {
 
 	if err := scanner.Err(); err != nil {
 		if errors.Is(err, bufio.ErrTooLong) {
-			return res, fmt.Errorf("[{!} analyzeFile] предупреждение: в файле встречена строка длиннее 10MB, сканирование прервано: %w", err)
+			return nil, fmt.Errorf("[{!} analyzeFile] предупреждение: в файле встречена строка длиннее 10MB, сканирование прервано: %w", err)
 		}
-		return res, fmt.Errorf("[{!} analyzeFile] ошибка чтения файла: %w", err)
+		return nil, fmt.Errorf("[{!} analyzeFile] ошибка чтения файла: %w", err)
 	}
-
-	return res, nil
+	return findings, nil
 }
 
-func analyzeDirectory(directoryPath string, rules []Rule) ([]Finding, error) {
-	skipDirectory := []string{".git", ".idea", "node_modules"}
+func analyzeDirectory(ctx context.Context, directoryPath string, rules []Rule, workers int) ([]Finding, error) {
 
 	var findings []Finding
 
-	err := filepath.WalkDir(directoryPath, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			log.Printf("[{!} analyzeDirectory] error: %s", err.Error())
-			return nil
-		}
+	skipDirectory := []string{".git", ".idea", "node_modules"}
 
-		if d.IsDir() {
-			if slices.Contains(skipDirectory, d.Name()) {
-				return filepath.SkipDir
+	jobsChan := make(chan string)
+	resultChan := make(chan Finding)
+
+	var wg sync.WaitGroup
+
+	walkErrCh := make(chan error, 1)
+
+	go func() {
+		defer close(jobsChan)
+
+		walkErr := filepath.WalkDir(directoryPath, func(path string, d fs.DirEntry, err error) error {
+
+			if ctx.Err() != nil {
+				return filepath.SkipAll
 			}
-			return nil
-		}
-		if !d.Type().IsRegular() {
-			return nil
-		}
+			if err != nil {
+				log.Printf("[{!} analyzeDirectory] error: %s", err.Error())
+				return nil
+			}
 
-		info, err := d.Info()
-		if err != nil {
-			return nil
-		}
+			if d.IsDir() {
+				if slices.Contains(skipDirectory, d.Name()) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !d.Type().IsRegular() {
+				return nil
+			}
 
-		if info.Size() > 157_286_400 {
-			log.Printf("[{!} analyzeDirectory] file %s more than 150mb", path)
-			return nil
-		}
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
 
-		finding, err := analyzeFile(path, rules)
+			if info.Size() > 157_286_400 {
+				log.Printf("[{!} analyzeDirectory] file %s more than 150mb", path)
+				return nil
+			}
 
-		if len(finding) != 0 {
-			findings = append(findings, finding...)
-		}
-		if err != nil {
-			log.Printf("[{!} analyzeDirectory] %s: %v", path, err)
-		}
+			select {
+			case jobsChan <- path:
+				return nil
+			case <-ctx.Done():
+				return filepath.SkipAll
+			}
+		})
+		walkErrCh <- walkErr
+	}()
 
-		return nil
-	})
-	if err != nil {
-		return nil, err
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range jobsChan {
+				fileFindings, err := analyzeFile(ctx, path, rules)
+				if err != nil {
+					if !errors.Is(err, context.Canceled) {
+						log.Printf("[!] %s: %v", path, err)
+					}
+					continue
+				}
+				for _, f := range fileFindings {
+					select {
+					case resultChan <- f:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}()
 	}
 
-	return findings, err
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
 
+	for res := range resultChan {
+		finding := Finding{
+			RuleID:   res.RuleID,
+			Severity: res.Severity,
+			FilePath: res.FilePath,
+			Line:     res.Line,
+			Match:    res.Match,
+		}
+		fmt.Println()
+		fmt.Printf("RuleID: %s\n", finding.RuleID)
+		fmt.Printf("Severity: %s\n", finding.Severity)
+		fmt.Printf("FilePath: %s\n", finding.FilePath)
+		fmt.Printf("Line: %d\n", finding.Line)
+		fmt.Printf("Match: %s\n", finding.Match)
+
+		findings = append(findings, finding)
+	}
+
+	if err := <-walkErrCh; err != nil {
+		return findings, err
+	}
+
+	return findings, ctx.Err()
+}
+
+func shannonEntropy(s string) float64 {
+	if len(s) == 0 {
+		return 0
+	}
+
+	freq := make(map[rune]float64)
+	var length float64
+	for _, r := range s {
+		freq[r]++
+		length++
+	}
+
+	var entropy float64
+
+	for _, count := range freq {
+		p := count / length
+		entropy -= p * math.Log2(p)
+	}
+	return entropy
 }
 
 func main() {
 	var (
-		path string
-		file string
+		path    string
+		file    string
+		rules   string
+		workers int
 	)
+
+	var findings []Finding
+
 	flag.StringVar(&path, "path", ".", "directory check")
 	flag.StringVar(&file, "file", "", "file check")
+	flag.StringVar(&rules, "rules", "", "set rules")
+	flag.IntVar(&workers, "workers", runtime.NumCPU(), "set count workers")
 	flag.Parse()
 
-	tgBotToken := Rule{
-		ID:          "tg-bot-token",
-		Description: "Detected telegram bot token",
-		Pattern:     regexp.MustCompile(`\b[0-9]{8,10}:[a-zA-Z0-9_-]{35}\b`),
-		Severity:    "WARNING",
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
-	privateKey := Rule{
-		ID:          "private-key",
-		Description: "Detected private key",
-		Pattern:     regexp.MustCompile(`-----BEGIN (?:RSA|DSA|EC|OPENSSH|PGP) PRIVATE KEY-----`),
-		Severity:    "WARNING",
-	}
-
-	rules := []Rule{tgBotToken, privateKey}
-	var findings []Finding
+	var loadedRules []Rule
 	var err error
 
+	if len(rules) == 0 {
+		loadedRules = getBaseRules()
+	} else {
+		loadedRules, err = loadRules(rules)
+	}
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("[*] %d rules have been loaded\n", len(loadedRules))
+
 	if len(file) != 0 {
-		findings, err = analyzeFile(file, rules)
+		findings, err = analyzeFile(ctx, file, loadedRules)
 	} else if len(path) != 0 {
 
 		if path == "." {
@@ -205,11 +323,10 @@ func main() {
 			if err != nil {
 				panic(err)
 			}
-			findings, err = analyzeDirectory(path, rules)
+			findings, err = analyzeDirectory(ctx, path, loadedRules, workers)
 
 		} else {
-			findings, err = analyzeDirectory(path, rules)
-
+			findings, err = analyzeDirectory(ctx, path, loadedRules, workers)
 		}
 	}
 
@@ -218,12 +335,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	for _, finding := range findings {
-		fmt.Println()
-		fmt.Printf("RuleID: %s\n", finding.RuleID)
-		fmt.Printf("Severity: %s\n", finding.Severity)
-		fmt.Printf("FilePath: %s\n", finding.FilePath)
-		fmt.Printf("Line: %d\n", finding.Line)
-		fmt.Printf("Match: %s\n", finding.Match)
+	if ctx.Err() != nil {
+		fmt.Println("\n[!] Сканирование прервано пользователем (Ctrl+C).")
+	} else {
+		fmt.Println("\n[+] Сканирование успешно завершено.")
 	}
+
+	fmt.Printf("len of finded = %d", len(findings))
 }
